@@ -3,14 +3,14 @@ import Foundation
 /// 產生恢復／接手用的終端機指令。所有參數都經過 POSIX 單引號跳脫。
 public enum ResumeCommandBuilder {
     /// - codex：`codex resume <SESSION_ID> [PROMPT]`（官方 CLI，UUID 優先於名稱解析）。
-    /// - Claude Code：`claude --resume <session-id> [prompt]`。
+    /// - Claude Code：`claude --resume <session-id>`。
     public static func command(for plan: ResumePlan, codexBinary: String = "codex", claudeBinary: String = "claude") -> String {
         let q = ShellQuote.quote
         let tool: String
         switch plan.provider {
         case .codex: tool = "\(q(codexBinary)) resume \(q(plan.sessionID)) \(q(plan.prompt))"
-        case .claudeCode: tool = "\(q(claudeBinary)) --resume \(q(plan.sessionID)) \(q(plan.prompt))"
-        case .cursor, .antigravity: preconditionFailure("ResumePlan 不允許此服務")
+        case .claudeCode: tool = "\(q(claudeBinary)) --resume \(q(plan.sessionID))"
+        case .cursor, .antigravity: preconditionFailure("ResumePlan does not support this provider")
         }
         return "cd \(q(plan.cwd)) && \(tool)"
     }
@@ -40,6 +40,7 @@ public struct HandoffPromptBuilder: Sendable {
     }
 
     /// 貼給「目前正在工作、額度快用盡」的 agent：請它把狀態封裝成交接檔。
+    // l10n-ignore：封裝指令是送給 agent 的內容。
     public func packPrompt(agent: ProviderID, sessionID: String?, cwd: String?) -> String {
         let place = cwd.map { "\($0)/\(handoffRelativePath)" } ?? handoffRelativePath
         return """

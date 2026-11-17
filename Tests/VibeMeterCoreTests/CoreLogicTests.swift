@@ -58,6 +58,18 @@ private func w(_ kind: WindowKind, _ used: Double, resetIn: TimeInterval?) -> Us
         #expect(store.latestSnapshot()?.observedAt == t0)
     }
 
+    @Test func repeatedStatusLinePayloadDoesNotRefreshObservationTime() throws {
+        let store = ClaudeBridgeStore(paths: VibeMeterPaths(root: TestSupport.tempDir()))
+        try store.recordStatusLine(Data(statusJSON.utf8), now: t0)
+        try store.recordStatusLine(Data(statusJSON.utf8), now: t0.addingTimeInterval(930))
+        #expect(store.latestSnapshot()?.observedAt == t0)
+        let changed = statusJSON.replacingOccurrences(of: "92.5", with: "93")
+        try store.recordStatusLine(Data(changed.utf8), now: t0.addingTimeInterval(940))
+        #expect(store.latestSnapshot()?.observedAt == t0)
+        #expect(store.latestSnapshot()?.window(.fiveHour)?.usedPercent == 92.5)
+        #expect(store.latestSnapshot()?.responseTimeUnknown == true)
+    }
+
     @Test func rejectsNonUUIDSessionIDs() throws {
         let store = ClaudeBridgeStore(paths: VibeMeterPaths(root: TestSupport.tempDir()))
         try store.recordStatusLine(Data(#"{"session_id":"../../evil","cwd":"/"}"#.utf8), now: t0)
@@ -133,31 +145,6 @@ private func w(_ kind: WindowKind, _ used: Double, resetIn: TimeInterval?) -> Us
         let (installer, url) = try setup("{ not json")
         #expect(throws: (any Error).self) { try installer.install(bridge: URL(fileURLWithPath: "/b/vibemeter-bridge"), now: t0) }
         #expect(try String(contentsOf: url, encoding: .utf8) == "{ not json")
-    }
-}
-
-@Suite struct AlertPolicyTests {
-    let policy = AlertPolicy(thresholds: [80, 95])
-
-    @Test func firesHighestCrossedThresholdOnce() {
-        let s85 = TestSupport.snapshot(observedAt: t0, windows: [w(.fiveHour, 85, resetIn: 3600), w(.weekly, 50, resetIn: 86400)])
-        let first = policy.alerts(for: [s85], now: t0, alreadyFired: [])
-        #expect(first.map(\.threshold) == [80])
-        let fired = Set(first.map(\.dedupeKey))
-        #expect(policy.alerts(for: [s85], now: t0, alreadyFired: fired).isEmpty)
-
-        let s96 = TestSupport.snapshot(observedAt: t0, windows: [w(.fiveHour, 96, resetIn: 3600)])
-        let second = policy.alerts(for: [s96], now: t0, alreadyFired: fired)
-        #expect(second.map(\.threshold) == [95])
-        #expect(second.first?.title == "Codex 5 小時額度剩 4%")
-    }
-
-    @Test func newCycleAlertsAgainAndStaleDataIsIgnored() {
-        let old = TestSupport.snapshot(observedAt: t0, windows: [w(.fiveHour, 90, resetIn: 3600)])
-        let fired = Set(policy.alerts(for: [old], now: t0, alreadyFired: []).map(\.dedupeKey))
-        let nextCycle = TestSupport.snapshot(observedAt: t0, windows: [w(.fiveHour, 90, resetIn: 3600 + 18000)])
-        #expect(policy.alerts(for: [nextCycle], now: t0, alreadyFired: fired).count == 1)
-        #expect(policy.alerts(for: [old], now: t0.addingTimeInterval(DataSource.codexAppServer.staleAfter + 1), alreadyFired: []).isEmpty)
     }
 }
 

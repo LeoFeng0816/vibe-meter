@@ -1,29 +1,48 @@
 import Foundation
 import UserNotifications
 
-/// 系統通知。只有以 .app 形式執行（有 bundle id）時才可用；`swift run` 時改為只記錄。
+/// 每次發送前讀取目前授權。系統接受通知後才回報成功。
 @MainActor
 final class Notifier {
-    private var authorized: Bool?
+    typealias ReadStatus = @MainActor () async -> NotificationStatus
+    typealias Deliver = @MainActor (String, String, String) async throws -> Void
 
-    private var available: Bool { Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app" }
+    private let readStatus: ReadStatus
+    private let deliver: Deliver
 
-    func post(id: String, title: String, body: String) {
-        guard available else {
-            print("[通知] \(title) — \(body)")
-            return
-        }
-        let center = UNUserNotificationCenter.current()
-        Task {
-            if authorized == nil {
-                authorized = (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+    static var available: Bool { Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app" }
+
+    init(readStatus: ReadStatus? = nil, deliver: Deliver? = nil) {
+        self.readStatus = readStatus ?? {
+            guard Self.available else { return .unavailable }
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            return switch settings.authorizationStatus {
+            case .authorized, .ephemeral: .authorized
+            case .provisional: .provisional
+            case .denied: .denied
+            case .notDetermined: .notDetermined
+            @unknown default: .unknown
             }
-            guard authorized == true else { return }
+        }
+        self.deliver = deliver ?? { id, title, body in
             let content = UNMutableNotificationContent()
             content.title = title
             content.body = body
             content.sound = .default
-            try? await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+            try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+        }
+    }
+
+    func status() async -> NotificationStatus { await readStatus() }
+
+    func post(id: String, title: String, body: String, stillAllowed: @MainActor () -> Bool) async -> Bool {
+        let status = await readStatus()
+        guard (status == .authorized || status == .provisional), stillAllowed() else { return false }
+        do {
+            try await deliver(id, title, body)
+            return true
+        } catch {
+            return false
         }
     }
 }

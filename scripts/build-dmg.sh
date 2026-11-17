@@ -7,12 +7,12 @@ cd "$(dirname "$0")/.."
 
 # 發布版一律從乾淨狀態重建（避免殘留舊的中間檔）。
 swift package clean
-rm -rf "build/Vibe Meter.app" build/AppIcon.iconset
+rm -rf "build/v0.1.1/Vibe Meter.app" build/v0.1.1/AppIcon.iconset
 ./scripts/build-app.sh
-APP="build/Vibe Meter.app"
+APP="build/v0.1.1/Vibe Meter.app"
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist")
 OUT="dist/Vibe-Meter-$VERSION.dmg"
-WORK=build/dmg
+WORK=build/v0.1.1/dmg
 rm -rf "$WORK"; mkdir -p "$WORK" dist
 
 # 背景（1x＋2x 合成 HiDPI TIFF）

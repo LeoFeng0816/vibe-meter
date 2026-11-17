@@ -22,8 +22,12 @@ public struct VibeMeterPaths: Sendable {
         return VibeMeterPaths(root: applicationSupport.appendingPathComponent(folderName))
     }
 
+    public var antigravityDir: URL { root.appendingPathComponent("antigravity") }
+    public var antigravitySnapshot: URL { antigravityDir.appendingPathComponent("quota.json") }
+
     public var claudeDir: URL { root.appendingPathComponent("claude") }
     public var claudeRateLimits: URL { claudeDir.appendingPathComponent("rate-limits.json") }
+    public var claudeActivity: URL { claudeDir.appendingPathComponent("activity.json") }
     public var claudeSessionsDir: URL { claudeDir.appendingPathComponent("sessions") }
     public var claudeEvents: URL { claudeDir.appendingPathComponent("events.jsonl") }
     public var claudeChain: URL { claudeDir.appendingPathComponent("statusline-chain.json") }

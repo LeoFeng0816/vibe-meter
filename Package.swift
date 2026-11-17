@@ -1,5 +1,10 @@
 // swift-tools-version: 6.0
+import Foundation
 import PackageDescription
+
+let sparklePath = ProcessInfo.processInfo.environment["VIBEMETER_SPARKLE_XCFRAMEWORK"]
+let updaterTargets: [Target] = sparklePath.map { [.binaryTarget(name: "Sparkle", path: $0)] } ?? []
+let appDependencies: [Target.Dependency] = ["VibeMeterCore", "VibeMeterUI"] + (sparklePath == nil ? [] : ["Sparkle"])
 
 let package = Package(
     name: "VibeMeter",
@@ -17,12 +22,14 @@ let package = Package(
         // 選單介面與 App 狀態（App 與預覽渲染器共用同一套畫面）。
         .target(name: "VibeMeterUI", dependencies: ["VibeMeterCore"]),
         // 選單列 App（SwiftUI MenuBarExtra）。
-        .executableTarget(name: "VibeMeter", dependencies: ["VibeMeterCore", "VibeMeterUI"]),
+        .executableTarget(name: "VibeMeter", dependencies: appDependencies, linkerSettings: sparklePath == nil ? [] : [
+            .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
+        ]),
         // 給 Claude Code statusLine / StopFailure hook 呼叫的小工具。
         .executableTarget(name: "vibemeter-bridge", dependencies: ["VibeMeterCore"]),
         // 以真實 SwiftUI 畫面＋範例資料輸出介面預覽 PNG（不是螢幕截圖）。
         .executableTarget(name: "vibemeter-preview", dependencies: ["VibeMeterCore", "VibeMeterUI"]),
         .testTarget(name: "VibeMeterCoreTests", dependencies: ["VibeMeterCore"]),
         .testTarget(name: "VibeMeterUITests", dependencies: ["VibeMeterCore", "VibeMeterUI"]),
-    ]
+    ] + updaterTargets
 )

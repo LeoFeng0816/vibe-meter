@@ -1,3 +1,5 @@
+import CoreFoundation
+import Darwin
 import Foundation
 
 /// 找到本機的 Codex CLI。不在 PATH 時，檢查 ChatGPT／Codex 桌面版內附的 CLI。
@@ -34,8 +36,8 @@ public enum CodexAppServerError: Error, LocalizedError, Equatable {
         switch self {
         case .binaryNotFound: "找不到 Codex CLI"
         case .timeout: "Codex app-server 回應逾時"
-        case .processFailed(let s): "無法啟動 Codex app-server：\(s)"
-        case .rpcError(let s): "Codex 回報錯誤：\(s)"
+        case .processFailed(let s): L10n.token("無法啟動 Codex app-server：{0}", [s])
+        case .rpcError(let s): L10n.token("Codex 回報錯誤：{0}", [s])
         case .malformedResponse: "Codex 回應格式無法辨識"
         }
     }
@@ -44,10 +46,10 @@ public enum CodexAppServerError: Error, LocalizedError, Equatable {
 /// 透過官方 `codex app-server`（JSON-RPC over stdio）唯讀查詢。
 ///
 /// 安全邊界：只會送出 `allowedMethods` 中的唯讀方法——
-/// `account/rateLimits/read`（額度）與 `thread/turns/list`（讀取指定 thread 最新 turn 的狀態與錯誤）。
+/// `account/rateLimits/read`（額度）、`thread/turns/list`（指定 thread 最新 turn 的狀態與錯誤）與 `thread/read`（thread 目前模型）。
 /// 絕不呼叫 `account/rateLimitResetCredit/consume`（會用掉使用者的重設額度）或任何 thread 寫入／啟動方法。
 public struct CodexAppServerClient: Sendable {
-    public static let allowedMethods: Set<String> = ["initialize", "initialized", "account/rateLimits/read", "thread/turns/list"]
+    public static let allowedMethods: Set<String> = ["initialize", "initialized", "account/rateLimits/read", "thread/turns/list", "thread/read"]
 
     public var binary: URL
     public var timeout: Duration
@@ -59,7 +61,7 @@ public struct CodexAppServerClient: Sendable {
 
     static let requestID = 2
 
-    static func requestLines(method: String, params: [String: Any]? = nil, clientVersion: String = "0.1.0") -> [String] {
+    static func requestLines(method: String, params: [String: Any]? = nil, clientVersion: String = "0.1.1") -> [String] {
         var call: [String: Any] = ["jsonrpc": "2.0", "id": requestID, "method": method]
         if let params { call["params"] = params }
         let messages: [[String: Any]] = [
@@ -68,7 +70,7 @@ public struct CodexAppServerClient: Sendable {
             ["jsonrpc": "2.0", "method": "initialized"],
             call,
         ]
-        for m in messages { precondition(allowedMethods.contains(m["method"] as! String), "不允許的 app-server 方法") }
+        for m in messages { precondition(allowedMethods.contains(m["method"] as! String), "app-server method not allowed") }
         return messages.map { String(decoding: try! JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]), as: UTF8.self) }
     }
 
@@ -85,7 +87,7 @@ public struct CodexAppServerClient: Sendable {
     }
 
     public func readRateLimits(now: @escaping @Sendable () -> Date = { Date() }) async throws -> UsageSnapshot {
-        let data = try await call(method: "account/rateLimits/read")
+        let data = try await call(method: "account/rateLimits/read", params: ["excludeResetCreditDetails": true])
         return try CodexRateLimitParser.parseAppServerResult(data, observedAt: now())
     }
 
@@ -97,7 +99,22 @@ public struct CodexAppServerClient: Sendable {
         return try CodexTurnSummary.parseLatest(data)
     }
 
+    /// 指定 thread 目前設定的模型（唯讀 `thread/read`，不載入 turns）。官方說明：已載入時為目前設定，否則為最後保存的模型。
+    public func threadModel(threadID: String) async throws -> String? {
+        guard SessionID.isUUID(threadID) else { throw CodexAppServerError.rpcError("thread id 必須是 UUID") }
+        let data = try await call(method: "thread/read", params: ["threadId": threadID.lowercased(), "includeTurns": false])
+        return try Self.parseThreadModel(data, threadID: threadID)
+    }
+
+    static func parseThreadModel(_ data: Data, threadID: String) throws -> String? {
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let thread = obj["thread"] as? [String: Any], let id = thread["id"] as? String else { throw CodexAppServerError.malformedResponse }
+        guard id.lowercased() == threadID.lowercased() else { throw CodexAppServerError.malformedResponse }
+        return (thread["model"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     func call(method: String, params: [String: Any]? = nil) async throws -> Data {
+        try Task.checkCancellation()
         let process = Process()
         process.executableURL = binary
         process.arguments = ["app-server"]
@@ -105,35 +122,50 @@ public struct CodexAppServerClient: Sendable {
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = FileHandle.nullDevice
+        let killer = ProcessBox(process)
         do { try process.run() } catch { throw CodexAppServerError.processFailed(error.localizedDescription) }
-        defer {
-            try? stdin.fileHandleForWriting.close()
-            if process.isRunning { process.terminate() }
-        }
 
         let payload = Self.requestLines(method: method, params: params).joined(separator: "\n") + "\n"
-        stdin.fileHandleForWriting.write(Data(payload.utf8))
+        do {
+            try stdin.fileHandleForWriting.write(contentsOf: Data(payload.utf8))
+        } catch {
+            try? stdin.fileHandleForWriting.close()
+            await killer.waitForTermination()
+            throw CodexAppServerError.processFailed(error.localizedDescription)
+        }
 
         let timeout = self.timeout
         let handle = stdout.fileHandleForReading
-        let killer = ProcessBox(process)
-        return try await withThrowingTaskGroup(of: Data.self) { group in
-            group.addTask {
-                for try await line in handle.bytes.lines {
-                    if let result = try Self.extractResult(fromLine: line) { return result }
+        let result: Result<Data, Error>
+        do {
+            result = .success(try await withTaskCancellationHandler {
+                try await withThrowingTaskGroup(of: Data.self) { group in
+                    group.addTask {
+                        for try await line in handle.bytes.lines {
+                            if let result = try Self.extractResult(fromLine: line) { return result }
+                        }
+                        throw CodexAppServerError.malformedResponse
+                    }
+                    group.addTask {
+                        try await Task.sleep(for: timeout)
+                        // 讀取端卡在 pipe 上時，結束子程序才能讓它返回。
+                        killer.beginTermination()
+                        throw CodexAppServerError.timeout
+                    }
+                    defer { group.cancelAll() }
+                    guard let first = try await group.next() else { throw CodexAppServerError.malformedResponse }
+                    return first
                 }
-                throw CodexAppServerError.malformedResponse
-            }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                // 讀取端卡在 pipe 上時，結束子程序才能讓它返回。
-                killer.terminate()
-                throw CodexAppServerError.timeout
-            }
-            defer { group.cancelAll() }
-            guard let first = try await group.next() else { throw CodexAppServerError.malformedResponse }
-            return first
+            } onCancel: {
+                killer.beginTermination()
+            })
+        } catch {
+            result = .failure(error)
         }
+        try? stdin.fileHandleForWriting.close()
+        // 等子程序真正結束後才回傳，呼叫端的 single-flight 才代表「最多一個 app-server」。
+        await killer.waitForTermination()
+        return try result.get()
     }
 }
 
@@ -162,6 +194,7 @@ public struct CodexTurnSummary: Codable, Hashable, Sendable {
     }
 
     public var isInProgress: Bool { status == "inProgress" }
+    public var isTerminal: Bool { status == "completed" || status == "failed" || status == "interrupted" }
 
     static func parseLatest(_ data: Data) throws -> CodexTurnSummary? {
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -170,9 +203,13 @@ public struct CodexTurnSummary: Codable, Hashable, Sendable {
         var info: String?
         if let error = t["error"] as? [String: Any] {
             if let s = error["codexErrorInfo"] as? String { info = s }
-            else if let o = error["codexErrorInfo"] as? [String: Any] { info = o.keys.sorted().first }
+            else if let o = error["codexErrorInfo"] as? [String: Any], o.count == 1 { info = o.keys.first }
         }
-        func date(_ key: String) -> Date? { (t[key] as? Double).map { Date(timeIntervalSince1970: $0) } }
+        func date(_ key: String) -> Date? {
+            guard let raw = t[key] as? NSNumber, CFGetTypeID(raw) != CFBooleanGetTypeID(),
+                  raw.doubleValue.isFinite, raw.doubleValue > 0 else { return nil }
+            return Date(timeIntervalSince1970: raw.doubleValue)
+        }
         return CodexTurnSummary(id: id, status: status, errorInfo: info, startedAt: date("startedAt"), completedAt: date("completedAt"))
     }
 }
@@ -180,6 +217,40 @@ public struct CodexTurnSummary: Codable, Hashable, Sendable {
 /// Process 不是 Sendable；只用來在逾時時結束子程序。
 final class ProcessBox: @unchecked Sendable {
     private let process: Process
-    init(_ process: Process) { self.process = process }
-    func terminate() { if process.isRunning { process.terminate() } }
+    private let lock = NSLock()
+    private var termination: Task<Void, Never>?
+    private let exited: AsyncStream<Void>
+
+    init(_ process: Process) {
+        self.process = process
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        exited = stream
+        process.terminationHandler = { _ in continuation.finish() }
+    }
+
+    func waitForTermination() async {
+        await beginTermination().value
+    }
+
+    /// Escalate independently of the pipe reader, which may be blocked until the child exits.
+    @discardableResult
+    func beginTermination() -> Task<Void, Never> {
+        lock.withLock {
+            if let termination { return termination }
+            let process = self.process
+            let exited = self.exited
+            let task = Task.detached {
+                let clock = ContinuousClock()
+                if process.isRunning { process.terminate() }
+                let deadline = clock.now.advanced(by: .seconds(2))
+                while process.isRunning, clock.now < deadline {
+                    try? await clock.sleep(for: .milliseconds(20))
+                }
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                for await _ in exited {}
+            }
+            termination = task
+            return task
+        }
+    }
 }

@@ -57,10 +57,10 @@ public enum BrandIcons {
         switch provider {
         case .cursor:
             BundledAsset(light: "cursor-light.png", dark: "cursor-dark.png",
-                         source: "Cursor 官方品牌資源 cursor.com/brand（App Icon 2.5D）", shape: .squareTile)
+                         source: "Cursor brand assets · cursor.com/brand (App Icon 2.5D)", shape: .squareTile)
         case .antigravity:
             BundledAsset(light: "antigravity.png", dark: "antigravity.png",
-                         source: "Google Antigravity 官方媒體素材 antigravity.google/press（Icon – Full Color）", shape: .glyph)
+                         source: "Google Antigravity press kit · antigravity.google/press (Icon – Full Color)", shape: .glyph)
         default:
             nil
         }
@@ -103,11 +103,11 @@ public enum BrandIcons {
         if let res = c.resource {
             let file = app.appendingPathComponent("Contents/Resources/\(dark ? res.dark : res.light)")
             if let image = NSImage(contentsOf: file) {
-                return Icon(image: image, source: "本機 \(app.lastPathComponent)（\(bundleID)）內附 \(file.lastPathComponent)", shape: .appIcon)
+                return Icon(image: image, source: "\(app.lastPathComponent) (\(bundleID)) · \(file.lastPathComponent)", shape: .appIcon)
             }
         }
         return Icon(image: NSWorkspace.shared.icon(forFile: app.path),
-                    source: "本機 \(app.lastPathComponent)（\(bundleID)）App 圖示", shape: .appIcon)
+                    source: "\(app.lastPathComponent) (\(bundleID)) · App icon", shape: .appIcon)
     }
 
     static func loadBundled(_ provider: ProviderID, dark: Bool) -> Icon? {
@@ -136,8 +136,8 @@ public struct AgentIcon: View {
         if let icon = BrandIcons.icon(for: provider, dark: scheme == .dark) {
             iconView(icon)
                 .frame(width: size, height: size)
-                .help("官方圖示來源：\(icon.source)")
-                .accessibilityLabel("\(provider.displayName) 圖示")
+                .help(tr("官方圖示來源：{0}", icon.source))
+                .accessibilityLabel(tr("{0} 圖示", provider.displayName))
         } else {
             RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
                 .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [2.5, 2]))
@@ -145,8 +145,8 @@ public struct AgentIcon: View {
                 .frame(width: size, height: size)
                 .overlay(Text(provider.monogram).font(.system(size: size * 0.36, weight: .semibold, design: .rounded))
                     .foregroundStyle(.secondary))
-                .help("沒有取得 \(provider.displayName) 的官方圖示；此為文字標記，不是品牌圖示")
-                .accessibilityLabel("\(provider.displayName)（未取得官方圖示）")
+                .help(tr("沒有取得 {0} 的官方圖示；此為文字標記，不是品牌圖示", provider.displayName))
+                .accessibilityLabel(tr("{0}（未取得官方圖示）", provider.displayName))
         }
     }
 

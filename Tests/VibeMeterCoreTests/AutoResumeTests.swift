@@ -4,7 +4,9 @@ import Testing
 
 private let t0 = Date(timeIntervalSince1970: 1_794_190_000)
 private let account = ClaudeAccountIdentity(authMethod: "claude.ai", orgID: "org-1", subscriptionType: "pro", accountKey: "k1")
-private let codexCtx = CodexResumeContext(accountID: "acct-1", anchorTurnID: "turn-1", verifiedLimitFailure: true, verifiedAccountAndModelAtBlock: true)
+private let codexCtx = CodexBlockEvidence(turnModel: "gpt-test", creatorAccountHash: nil,
+                                           officialAccountAtBlock: "acct-1", liveAccountID: "acct-1")
+    .context(anchorTurnID: "turn-1")
 private func claudeCtx(model: String? = "claude-opus-5-5", limit: String? = "five_hour", overage: String? = "rejected",
                        account acct: ClaudeAccountIdentity? = account, verifiedAccountAtBlock: Bool? = true) -> ClaudeResumeContext {
     ClaudeResumeContext(model: model, limitType: limit, overageStatus: overage, account: acct, anchorMessageUUID: "msg-1",
@@ -25,10 +27,13 @@ private func claudePlan(_ ctx: ClaudeResumeContext = claudeCtx(), reset: TimeInt
 private func live(_ fiveHour: Double, weekly: Double = 60, at offset: TimeInterval = 3700, allowed: Bool? = true,
                   account: String? = "acct-1", source: DataSource = .codexAppServer, reached: String? = nil) -> (UsageSnapshot, Date) {
     let at = t0.addingTimeInterval(offset)
-    return (UsageSnapshot(provider: .codex, windows: [
+    let windows = [
         UsageWindow(kind: .fiveHour, usedPercent: fiveHour, resetsAt: at.addingTimeInterval(18000)),
         UsageWindow(kind: .weekly, usedPercent: weekly, resetsAt: at.addingTimeInterval(86400)),
-    ], observedAt: at, source: source, limitReachedType: reached, accountID: account, usageAllowed: allowed), at)
+    ]
+    return (UsageSnapshot(provider: .codex, windows: windows, observedAt: at, source: source,
+                          limitReachedType: reached, accountID: account, usageAllowed: allowed,
+                          buckets: [LimitBucket(limitID: "fixture", modelSlug: "gpt-test", windows: windows, limitReachedType: reached)]), at)
 }
 
 private func state(_ plan: ResumePlan, _ event: ResumeEvent) -> ResumePlan.State { ResumeReducer.reduce(plan, event).0.state }
@@ -57,16 +62,12 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
         #expect(isNeedsConfirmation(try codexPlan(ctx: CodexResumeContext(accountID: nil, anchorTurnID: "t", verifiedLimitFailure: true)).state))
         #expect(isNeedsConfirmation(try codexPlan(ctx: CodexResumeContext(accountID: "a", anchorTurnID: nil, verifiedLimitFailure: false)).state))
         #expect(isNeedsConfirmation(try codexPlan(ctx: CodexResumeContext(
-            accountID: "a", anchorTurnID: "t", verifiedLimitFailure: false, verifiedAccountAndModelAtBlock: true)).state))
+            accountID: "a", anchorTurnID: "t", verifiedLimitFailure: false)).state))
         #expect(isNeedsConfirmation(try codexPlan(ctx: CodexResumeContext(
             accountID: "a", anchorTurnID: "t", verifiedLimitFailure: true)).state))
-        #expect(try claudePlan().state == .waiting)
+        // Claude Code 交給官方原生自動繼續：任何 Claude 計畫都不會進入自動等待。
+        #expect(try claudePlan().state == .needsConfirmation(reason: ClaudeNativeContinue.handledNatively, at: t0))
         #expect(isNeedsConfirmation(try claudePlan(claudeCtx(verifiedAccountAtBlock: nil)).state))
-        #expect(isNeedsConfirmation(try claudePlan(claudeCtx(model: nil)).state))            // 模型不明
-        #expect(isNeedsConfirmation(try claudePlan(claudeCtx(limit: nil)).state))            // 週期不明
-        #expect(isNeedsConfirmation(try claudePlan(claudeCtx(account: nil)).state))          // 帳戶不明
-        #expect(isNeedsConfirmation(try claudePlan(claudeCtx(overage: nil)).state))          // 可能有額外付費
-        #expect(isNeedsConfirmation(try claudePlan(claudeCtx(overage: "allowed")).state))
         let apiKey = ClaudeAccountIdentity(authMethod: "api_key", orgID: nil, subscriptionType: nil, accountKey: "x")
         #expect(isNeedsConfirmation(try claudePlan(claudeCtx(account: apiKey)).state))      // API 計費帳戶
     }
@@ -92,10 +93,11 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
         let p = try codexPlan()
         let (denied, n1) = live(0, allowed: false)
         #expect(state(p, .observed(denied, now: n1, autoContinue: true)) == .waiting)
+        // null：依官方註解不可由百分比推斷恢復 → 繼續等待（不送出、不宣稱恢復），之後的明確許可仍可確認。
         let (unknown, n2) = live(0, allowed: nil)
         let (next, effects) = ResumeReducer.reduce(p, .observed(unknown, now: n2, autoContinue: true))
-        #expect(isNeedsConfirmation(next.state))
-        #expect(effects == [.notifyNeedsConfirmation])
+        #expect(next.state == .waiting)
+        #expect(effects.isEmpty)
         let (ok, n3) = live(0, allowed: true)
         let (launched, e) = ResumeReducer.reduce(p, .observed(ok, now: n3, autoContinue: true))
         #expect(launched.state == .launching(startedAt: n3))
@@ -123,7 +125,8 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
     @Test func claudePlansIgnoreSnapshots() throws {
         var snap = live(0).0
         snap.provider = .claudeCode
-        #expect(state(try claudePlan(), .observed(snap, now: snap.observedAt, autoContinue: true)) == .waiting)
+        let plan = try claudePlan()
+        #expect(state(plan, .observed(snap, now: snap.observedAt, autoContinue: true)) == plan.state)
     }
 }
 
@@ -135,107 +138,7 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
     #expect(LaunchDecision.codexPreflight(latest: limited, anchorTurnID: "t", requireLimitFailure: true) == .unchanged)
 }
 
-@Suite struct ClaudeProbeTests {
-    func output(model: String = "claude-opus-5-5", status: String = "allowed", type: String = "five_hour",
-                windows: String? = nil, overage: Bool = false, result: String = #""subtype":"success","is_error":false"#) -> String {
-        let w = windows ?? #""five_hour":{"utilization":0.02,"resetsAt":1794223800,"status":"allowed"},"seven_day":{"utilization":0.3,"resetsAt":1794708000,"status":"allowed"}"#
-        return """
-        {"type":"system","subtype":"init","model":"\(model)"}
-        {"type":"assistant","message":{"model":"\(model)"}}
-        {"type":"rate_limit_event","rate_limit_info":{"status":"\(status)","resetsAt":1794223800,"rateLimitType":"\(type)","overageStatus":"rejected","isUsingOverage":\(overage),"unifiedWindows":{\(w)}}}
-        {"type":"result",\(result),"modelUsage":{"\(model)":{}}}
-        """
-    }
-
-    func eval(_ out: String, model: String = "claude-opus-5-5", blocked: String = "five_hour") -> ClaudeProbeOutcome {
-        ClaudeProbe.evaluate(output: out, observedAt: t0, expectedModel: model, blockedLimitType: blocked)
-    }
-
-    @Test func sameModelWithAllowedBlockedWindowRestores() {
-        guard case .restored(let snap) = eval(output()) else { Issue.record("expected restored"); return }
-        #expect(snap.source == .claudeProbe)
-        #expect(abs((snap.window(.fiveHour)?.usedPercent ?? 0) - 2) < 0.001)
-    }
-
-    @Test func otherModelSucceedingIsNotRestore() {
-        // Haiku 可用不代表 Opus 已恢復
-        guard case .unsafe = eval(output(model: "claude-haiku-5-5")) else { Issue.record("expected unsafe"); return }
-        let mixed = output() + "\n" + #"{"type":"result","subtype":"success","is_error":false,"modelUsage":{"claude-haiku-5-5":{}}}"#
-        guard case .unsafe = eval(mixed) else { Issue.record("expected unsafe for mixed models"); return }
-        let noModel = output().replacingOccurrences(of: "claude-opus-5-5", with: "")
-            .replacingOccurrences(of: #"{"type":"system","subtype":"init","model":""}"#, with: "")
-        guard case .unsafe = eval(noModel) else { Issue.record("expected unsafe when model differs/empty"); return }
-    }
-
-    @Test func missingWindowsOrBlockedWindowIsUnconfirmed() {
-        guard case .unconfirmed = eval(output(windows: "")) else { Issue.record("no windows → unconfirmed"); return }
-        // 被擋住的是 Opus 專屬週期，但回應只有 five_hour／seven_day
-        guard case .unconfirmed = eval(output(), blocked: "seven_day_opus") else { Issue.record("missing blocked window"); return }
-        let opus = #""seven_day_opus":{"utilization":0.4,"resetsAt":1794708000,"status":"allowed"}"#
-        guard case .restored = eval(output(windows: opus), blocked: "seven_day_opus") else { Issue.record("opus window allowed"); return }
-        let noRLE = """
-        {"type":"system","subtype":"init","model":"claude-opus-5-5"}
-        {"type":"result","subtype":"success","is_error":false,"modelUsage":{"claude-opus-5-5":{}}}
-        """
-        guard case .unconfirmed = eval(noRLE) else { Issue.record("no rate_limit_event → unconfirmed"); return }
-    }
-
-    @Test func noImplicitPermissionToResume() {
-        let missingOverage = output().replacingOccurrences(of: #""isUsingOverage":false,"#, with: "")
-        guard case .unconfirmed = eval(missingOverage) else { Issue.record("missing overage flag"); return }
-        let missingWindowStatus = #""five_hour":{"utilization":0.02,"resetsAt":1794223800}"#
-        guard case .unconfirmed = eval(output(windows: missingWindowStatus)) else {
-            Issue.record("missing blocked-window status")
-            return
-        }
-    }
-
-    @Test func overageAndRejection() {
-        guard case .unsafe = eval(output(overage: true)) else { Issue.record("overage → unsafe"); return }
-        #expect(eval(output(status: "rejected", result: #""subtype":"success","is_error":true"#)) == .stillLimited(resetsAt: Date(timeIntervalSince1970: 1_794_223_800)))
-        let rejectedWindow = #""five_hour":{"utilization":1.0,"resetsAt":1794223800,"status":"rejected"}"#
-        #expect(eval(output(windows: rejectedWindow)) == .stillLimited(resetsAt: Date(timeIntervalSince1970: 1_794_223_800)))
-        #expect(eval("") == .failed("探測沒有回傳結果"))
-    }
-
-    @Test func probeUsesOriginalModelAndIsNonPersistent() {
-        let args = ClaudeProbe.arguments(model: "claude-opus-5-5")
-        #expect(args[args.firstIndex(of: "--model")! + 1] == "claude-opus-5-5")
-        #expect(args.contains("--no-session-persistence"))
-        #expect(args[args.firstIndex(of: "--max-turns")! + 1] == "1")
-        #expect(args[args.firstIndex(of: "--tools")! + 1] == "")
-    }
-
-    @Test func reducerHandlesProbeOutcomes() throws {
-        let p = try claudePlan()
-        let n = t0.addingTimeInterval(3700)
-        let snap = UsageSnapshot(provider: .claudeCode, windows: [UsageWindow(kind: .fiveHour, usedPercent: 1, resetsAt: nil)],
-                                 observedAt: n, source: .claudeProbe)
-        #expect(ResumeReducer.reduce(p, .probed(.restored(snap), now: n, autoContinue: true)).1 == [.launch])
-        #expect(isNeedsConfirmation(state(p, .probed(.unconfirmed("x"), now: n, autoContinue: true))))
-        #expect(isNeedsConfirmation(state(p, .probed(.unsafe("x"), now: n, autoContinue: true))))
-        #expect(isNeedsConfirmation(state(p, .accountMismatch("帳戶不同", now: n))))
-        let later = n.addingTimeInterval(7200)
-        #expect(ResumeReducer.reduce(p, .probed(.stillLimited(resetsAt: later), now: n, autoContinue: true)).0.expectedResetAt == later)
-    }
-
-    @Test func probePolicyThrottlesAndGivesUp() throws {
-        var p = try claudePlan()
-        #expect(!ProbePolicy.shouldProbe(p, now: t0.addingTimeInterval(3599)))   // 重設前不探測
-        var now = t0.addingTimeInterval(3600)
-        for i in 1...ProbePolicy.maxAttempts {
-            #expect(ProbePolicy.shouldProbe(p, now: now))
-            let (next, effects) = ResumeReducer.reduce(p, .probed(.stillLimited(resetsAt: nil), now: now, autoContinue: true))
-            p = next
-            #expect(!ProbePolicy.shouldProbe(p, now: now.addingTimeInterval(60)))
-            if i == ProbePolicy.maxAttempts { #expect(effects == [.notifyGaveUp] && p.state.isFinished) }
-            now = now.addingTimeInterval(ProbePolicy.minInterval)
-        }
-        // 資訊不足的計畫永遠不探測
-        #expect(!ProbePolicy.shouldProbe(try claudePlan(claudeCtx(model: nil)), now: now))
-        #expect(!ProbePolicy.shouldProbe(try claudePlan(claudeCtx(overage: "allowed")), now: now))
-    }
-
+@Suite struct ClaudeAccountTests {
     @Test func accountIdentityParsing() throws {
         let a = try #require(ClaudeAccountIdentity.parse(#"{"loggedIn":true,"authMethod":"claude.ai","email":"A@x.com","orgId":"o1","subscriptionType":"pro"}"#))
         let b = try #require(ClaudeAccountIdentity.parse(#"{"loggedIn":true,"authMethod":"claude.ai","email":"a@x.com","orgId":"o1"}"#))
@@ -295,7 +198,8 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
         let p = try claudePlan()
         try book.add(p)
         let decoded = try VibeMeterJSON.decoder.decode(ResumePlanBook.self, from: VibeMeterJSON.encoder.encode(book))
-        #expect(decoded.plans == book.plans)
+        #expect(decoded.plans.map(\.id) == book.plans.map(\.id))
+        #expect(decoded.plans.first?.claude?.verifiedAccountAtBlock == nil)
         book.apply(.userCancel(now: t0), to: p.id)
         #expect(book.plan(p.id)?.state == .cancelled(at: t0))
     }
@@ -330,8 +234,9 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
         #expect(LaunchDecision.decide(p, lastActivity: nil, threadLockHeld: false, cwdExists: true, preflight: .unchanged, now: now) == .deliver(.terminal))
         #expect(LaunchDecision.decide(p, lastActivity: nil, threadLockHeld: false, cwdExists: false, preflight: .unchanged, now: now) == .skip("工作目錄不存在"))
         #expect(LaunchDecision.decide(p, lastActivity: nil, threadLockHeld: true, cwdExists: true, preflight: .changed("x"), now: now) == .skip("x"))
-        #expect(LaunchDecision.decide(p, lastActivity: nil, threadLockHeld: true, cwdExists: true, preflight: .unknown("y"), now: now)
-                == .skip("無法確認工作階段狀態：y"))
+        guard case .skip(let reason) = LaunchDecision.decide(p, lastActivity: nil, threadLockHeld: true, cwdExists: true, preflight: .unknown("y"), now: now)
+        else { Issue.record("unknown preflight must skip"); return }
+        #expect(L10n.display(reason, in: .zhHant) == "無法確認工作階段狀態：y")
         #expect(ResumeExecutor.queueArguments(p) == ["queue", "--thread", TestSupport.sessionA, "--message", p.prompt])
     }
 }
@@ -356,7 +261,12 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
         ]
         let blocked = BlockedSessionDetector.codex(sessions: sessions, latestTurns: turns, snapshot: full, now: now)
         #expect(blocked.map(\.sessionID) == [ids[0]])
-        #expect(blocked.first?.codex == CodexResumeContext(accountID: nil, anchorTurnID: "a1", verifiedLimitFailure: true))
+        // 沒有中止時帳戶／模型證據 → 帳戶為空並記錄缺口（計畫會是待確認）
+        #expect(blocked.first?.codex?.accountID == nil)
+        #expect(blocked.first?.codex?.anchorTurnID == "a1")
+        #expect(blocked.first?.codex?.verifiedLimitFailure == true)
+        #expect(blocked.first?.codex?.verifiedAccountAndModelAtBlock != true)
+        #expect(blocked.first?.codex?.evidenceGap != nil)
         #expect(blocked.first?.eventKey == "codex|\(ids[0])|a1")
         #expect(blocked.first?.resetsAt == t0.addingTimeInterval(3600))
         // 沒有官方 turn 資料時，額度滿＋近期活動不會被當成被擋住
@@ -368,7 +278,7 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
         sub.parentThreadID = ids[1]
         let turns = [ids[0]: CodexTurnSummary(id: "a1", status: "failed", errorInfo: "usageLimitExceeded")]
         #expect(BlockedSessionDetector.codex(sessions: [sub], latestTurns: turns, snapshot: full, now: now).isEmpty)
-        #expect(BlockedSessionDetector.codexCandidates(sessions: [sub], snapshot: full, now: now).isEmpty)
+        #expect(BlockedSessionDetector.codexCandidates(sessions: [sub], now: now).isEmpty)
         #expect(BlockedSessionDetector.codexSuggestions(sessions: [sub], snapshot: full, latestTurns: [:]).isEmpty)
     }
 
@@ -409,14 +319,10 @@ private func isNeedsConfirmation(_ s: ResumePlan.State) -> Bool {
         #expect(BlockedSessionDetector.codexSuggestions(sessions: sessions, snapshot: notFull, latestTurns: [:]).isEmpty)
     }
 
-    @Test func candidatesOnlyWhenLimitedAndCapped() {
+    @Test func candidatesCheckRecentTurnsEvenAfterQuotaRecoveryAndAreCapped() {
         let many = (0..<8).map { i in session(String(format: "0e0e0e0%d-1111-4222-8333-944455556666", i), -Double(i) * 60) }
-        #expect(BlockedSessionDetector.codexCandidates(sessions: many, snapshot: full, now: now).count == BlockedSessionDetector.maxInspections)
-        var ok = full
-        ok.windows[0].usedPercent = 40
-        ok.usageAllowed = true
-        #expect(BlockedSessionDetector.codexCandidates(sessions: many, snapshot: ok, now: now).isEmpty)
-        #expect(BlockedSessionDetector.codexCandidates(sessions: [session(ids[0], -60, cwd: nil)], snapshot: full, now: now).isEmpty)
+        #expect(BlockedSessionDetector.codexCandidates(sessions: many, now: now).count == BlockedSessionDetector.maxInspections)
+        #expect(BlockedSessionDetector.codexCandidates(sessions: [session(ids[0], -60, cwd: nil)], now: now).isEmpty)
     }
 }
 

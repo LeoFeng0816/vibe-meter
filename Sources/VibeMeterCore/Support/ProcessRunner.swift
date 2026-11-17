@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct ProcessResult: Sendable {
@@ -13,7 +14,7 @@ public enum ProcessRunnerError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .timeout: "執行逾時"
-        case .launch(let s): "無法執行：\(s)"
+        case .launch(let s): L10n.token("無法執行：{0}", [s])
         }
     }
 }
@@ -36,30 +37,50 @@ public enum ProcessRunner {
         process.standardOutput = out
         process.standardError = err
         process.standardInput = input
+        let (exit, completed) = AsyncStream<Int32>.makeStream()
+        process.terminationHandler = {
+            completed.yield($0.terminationStatus)
+            completed.finish()
+        }
         do { try process.run() } catch {
+            completed.finish()
             throw ProcessRunnerError.launch(error.localizedDescription)
         }
         return Task {
-            try await withCheckedThrowingContinuation { continuation in
-                DispatchQueue.global().async {
-                    let timer = DispatchWorkItem { if process.isRunning { process.terminate() } }
-                    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
-                    if let stdin { input.fileHandleForWriting.write(stdin) }
-                    try? input.fileHandleForWriting.close()
-                    // 先讀完輸出，避免 pipe 塞滿造成死結。
-                    let outData = out.fileHandleForReading.readDataToEndOfFile()
-                    let errData = err.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
-                    let timedOut = !timer.isCancelled && process.terminationReason == .uncaughtSignal
-                    timer.cancel()
-                    if timedOut {
-                        continuation.resume(throwing: ProcessRunnerError.timeout)
-                    } else {
-                        continuation.resume(returning: ProcessResult(status: process.terminationStatus,
-                                                                     stdout: String(decoding: outData, as: UTF8.self),
-                                                                     stderr: String(decoding: errData, as: UTF8.self)))
-                    }
-                }
+            let timer = Task {
+                try await Task.sleep(for: .seconds(timeout))
+                if process.isRunning { process.terminate() }
+                try await Task.sleep(for: .seconds(2))
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            }
+            defer { timer.cancel() }
+            async let stdout = readPipe(out.fileHandleForReading)
+            async let stderr = readPipe(err.fileHandleForReading)
+            async let inputDone: Void = writeInput(input.fileHandleForWriting, data: stdin)
+            var iterator = exit.makeAsyncIterator()
+            guard let status = await iterator.next() else { throw ProcessRunnerError.timeout }
+            await inputDone
+            let (outData, errData) = await (stdout, stderr)
+            if process.terminationReason == .uncaughtSignal { throw ProcessRunnerError.timeout }
+            return ProcessResult(status: status, stdout: String(decoding: outData, as: UTF8.self),
+                                 stderr: String(decoding: errData, as: UTF8.self))
+        }
+    }
+
+    private static func readPipe(_ handle: FileHandle) async -> Data {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: handle.readDataToEndOfFile())
+            }
+        }
+    }
+
+    private static func writeInput(_ handle: FileHandle, data: Data?) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                if let data { try? handle.write(contentsOf: data) }
+                try? handle.close()
+                continuation.resume()
             }
         }
     }

@@ -38,7 +38,7 @@ public struct UsageCollector: Sendable {
             case .claudeCode: reports.append(claudeReport())
             case .codex: reports.append(await codexReport())
             case .cursor: reports.append(Self.cursorReport)
-            case .antigravity: reports.append(Self.antigravityReport)
+            case .antigravity: reports.append(antigravityCLIReport())
             }
         }
         return reports
@@ -50,18 +50,11 @@ public struct UsageCollector: Sendable {
         let logSnapshot = codexStore.latestRateLimitSnapshot()
         if let binary = codexBinary {
             do {
-                let live = try await CodexAppServerClient(binary: binary).readRateLimits()
-                let note: String?
-                switch live.usageAllowed {
-                case true?: note = nil
-                case false?: note = "後端回報目前不可使用一般用量"
-                case nil: note = "後端未提供使用許可（ordinaryUsageAllowed 為 null），自動繼續不會據此判定恢復"
-                }
-                return ProviderReport(provider: .codex, state: .available(live), note: note)
+                return Self.codexLiveReport(try await CodexAppServerClient(binary: binary).readRateLimits())
             } catch {
                 if let logSnapshot {
                     return ProviderReport(provider: .codex, state: .available(logSnapshot),
-                                          note: "即時查詢失敗（\(error.localizedDescription)），顯示本機紀錄；本機紀錄不作為自動繼續依據")
+                                          note: L10n.token("即時查詢失敗（{0}），顯示本機紀錄；本機紀錄不作為自動繼續依據", [error.localizedDescription]))
                 }
                 return ProviderReport(provider: .codex, state: .error(message: error.localizedDescription))
             }
@@ -75,18 +68,32 @@ public struct UsageCollector: Sendable {
         return ProviderReport(provider: .codex, state: .notConnected(reason: "找不到 Codex CLI，也沒有含額度的本機紀錄"))
     }
 
+    public static func codexLiveReport(_ live: UsageSnapshot) -> ProviderReport {
+        let note: String?
+        switch live.usageAllowed {
+        case true?: note = nil
+        case false?: note = "後端回報目前不可使用一般用量"
+        case nil: note = "後端未提供使用許可（ordinaryUsageAllowed 為 null），自動繼續不會據此判定恢復"
+        }
+        return ProviderReport(provider: .codex, state: .available(live), note: note)
+    }
+
     public func claudeReport() -> ProviderReport {
         switch claudeInstaller.status() {
         case .claudeNotFound:
             return ProviderReport(provider: .claudeCode, state: .notConnected(reason: "這台 Mac 沒有 Claude Code 設定資料夾"))
         case .notInstalled:
             if let snap = claudeStore.latestSnapshot() {
-                return ProviderReport(provider: .claudeCode, state: .available(snap))
+                return ProviderReport(provider: .claudeCode, state: .available(snap),
+                                      note: "目前未連接 Claude Code 狀態列，顯示上次回報")
             }
             return ProviderReport(provider: .claudeCode,
-                                  state: .notConnected(reason: "尚未連接。可連接狀態列自動回報，或按「查詢」送出一次極小的官方探測請求"))
+                                  state: .notConnected(reason: "尚未連接。連接 Claude Code 狀態列以接收官方用量回報。"))
         case .partial, .installed:
-            let note: String? = claudeInstaller.status() == .partial ? "連接設定不完整，請重新連接" : nil
+            let bridgeMissing = !claudeInstaller.usesLegacyBridge()
+                && !FileManager.default.isExecutableFile(atPath: claudeStore.paths.installedBridge.path)
+            let note: String? = bridgeMissing ? "設定指向的 Vibe Meter bridge 不存在，Claude Code 無法回報用量，請重新連接"
+                : claudeInstaller.status() == .partial ? "連接設定不完整，請重新連接" : nil
             if let snap = claudeStore.latestSnapshot() {
                 return ProviderReport(provider: .claudeCode, state: .available(snap), note: note)
             }
@@ -96,11 +103,18 @@ public struct UsageCollector: Sendable {
         }
     }
 
+    public func antigravityCLIReport() -> ProviderReport {
+        if let snapshot = AntigravityBridgeStore(paths: claudeStore.paths).latestSnapshot() {
+            return ProviderReport(provider: .antigravity, state: .available(snapshot))
+        }
+        return Self.antigravityReport
+    }
+
     public static let cursorReport = ProviderReport(
         provider: .cursor,
-        state: .unsupported(reason: "Cursor 沒有提供個人方案的官方用量 API（只有需登入的網頁儀表板），因此不顯示數字"))
+        state: .unsupported(reason: "個人用量可在 Cursor 編輯器設定或官方儀表板查看。公開 API 僅涵蓋團隊或 Cloud Agent，無法匯入個人剩餘用量。"))
 
     public static let antigravityReport = ProviderReport(
         provider: .antigravity,
-        state: .unsupported(reason: "Antigravity 沒有公開的額度查詢介面（只在其 App 內顯示），因此不顯示數字"))
+        state: .notConnected(reason: "Desktop 的用量在 Settings › Models。Vibe Meter 可讀取另行安裝的 Antigravity CLI 狀態列，等待設定與回報。"))
 }

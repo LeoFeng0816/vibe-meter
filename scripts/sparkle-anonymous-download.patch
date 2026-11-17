@@ -1,0 +1,310 @@
+--- a/Downloader/SPUDownloader.m
++++ b/Downloader/SPUDownloader.m
+@@ -15,6 +15,7 @@
+ 
+ 
+ #include "AppKitPrevention.h"
++#import <CommonCrypto/CommonDigest.h>
+ 
+ typedef NS_ENUM(NSUInteger, SPUDownloadMode)
+ {
+@@ -41,6 +42,8 @@
+     
+     BOOL _disabledAutomaticTermination;
+     BOOL _receivedExpectedBytes;
++    NSUInteger _byteLimit;
++    NSString *_expectedSHA256;
+ }
+ 
+ - (instancetype)initWithDelegate:(id <SPUDownloaderDelegate>)delegate
+@@ -52,56 +55,95 @@
+     return self;
+ }
+ 
+-- (void)startDownloadWithRequest:(NSURLRequest *)request SPU_OBJC_DIRECT
++// Vibe Meter's configured updater only downloads the pinned release feed and archive.
++static BOOL SUAllowedURL(NSURL *url, NSURL *original)
+ {
+-    if (request == nil) {
+-        NSString *message = @"The download request must not be nil";
+-        NSError *error = [NSError errorWithDomain:SUSparkleErrorDomain code:SUDownloadError userInfo:@{ NSLocalizedDescriptionKey: message }];
+-        [_delegate downloaderDidFailWithError:error];
+-        
+-        return;
++    if (url == nil || url.user != nil || url.password != nil || url.fragment != nil) {
++        return NO;
+     }
+-    
+-    // Prevent any unwanted URL schemes (e.g. file://)
+-    NSString *scheme = request.URL.scheme;
+-    if (scheme == nil) {
+-        NSString *message = @"The download request scheme must not be nil";
+-        NSError *error = [NSError errorWithDomain:SUSparkleErrorDomain code:SUDownloadError userInfo:@{ NSLocalizedDescriptionKey: message }];
+-        [_delegate downloaderDidFailWithError:error];
+-        
+-        return;
++#ifdef VIBEMETER_SPARKLE_LOOPBACK_FIXTURE
++    if ([url.scheme isEqualToString:@"http"] && [url.host isEqualToString:@"127.0.0.1"]) {
++        return original == nil || [url.port isEqual:original.port];
+     }
+-    
+-    if ([scheme caseInsensitiveCompare:@"http"] != NSOrderedSame && [scheme caseInsensitiveCompare:@"https"] != NSOrderedSame) {
+-        NSString *message = [NSString stringWithFormat:@"The download request URL must use http or https (%@)", request.URL];
+-        NSError *error = [NSError errorWithDomain:SUSparkleErrorDomain code:SUDownloadError userInfo:@{ NSLocalizedDescriptionKey: message }];
+-        [_delegate downloaderDidFailWithError:error];
+-        
++#endif
++    if (![url.scheme isEqualToString:@"https"] || url.port != nil) {
++        return NO;
++    }
++    NSString *host = url.host.lowercaseString;
++    if (original != nil && ([host isEqualToString:@"release-assets.githubusercontent.com"] ||
++                            [host isEqualToString:@"objects.githubusercontent.com"])) {
++        return YES;
++    }
++    if (![host isEqualToString:@"github.com"] || url.query != nil) {
++        return NO;
++    }
++    NSString *path = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO].percentEncodedPath;
++    if ([path isEqualToString:@"/LeoFeng0816/vibe-meter/releases/latest/download/appcast.xml"]) {
++        return original == nil;
++    }
++    if ([path rangeOfString:@"^/LeoFeng0816/vibe-meter/releases/download/v[0-9]+\\.[0-9]+\\.[0-9]+/(appcast\\.xml|Vibe-Meter-[0-9]+\\.[0-9]+\\.[0-9]+\\.zip)$"
++                       options:NSRegularExpressionSearch].location == NSNotFound) {
++        return NO;
++    }
++    if (original == nil) {
++        return [path hasSuffix:@".zip"];
++    }
++    return [original.path hasSuffix:@"/appcast.xml"] && [path hasSuffix:@"/appcast.xml"];
++}
++
++- (void)failDownloadWithMessage:(NSString *)message SPU_OBJC_DIRECT
++{
++    [_delegate downloaderDidFailWithError:[NSError errorWithDomain:SUSparkleErrorDomain code:SUDownloadError userInfo:@{NSLocalizedDescriptionKey: message}]];
++}
++
++- (void)startDownloadWithRequest:(NSURLRequest *)request SPU_OBJC_DIRECT
++{
++    if (!SUAllowedURL(request.URL, nil)) {
++        [self failDownloadWithMessage:@"The download URL is outside Vibe Meter's signed update source."];
+         return;
+     }
+-    
+-    _downloadSession = [NSURLSession
+-        sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]
+-        delegate:self
+-        delegateQueue:[NSOperationQueue mainQueue]];
+-    
+-    switch (_mode) {
+-        case SPUDownloadModePersistent:
+-            _sessionTask = [_downloadSession downloadTaskWithRequest:request];
+-            break;
+-        case SPUDownloadModeTemporary: {
+-            __weak __typeof__(self) weakSelf = self;
+-            _sessionTask = [_downloadSession dataTaskWithRequest:request completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+-                [weakSelf temporaryDownloadDidFinishWithData:data response:response error:error];
+-            }];
+-            break;
++
++    NSMutableURLRequest *anonymousRequest = [request mutableCopy];
++    if (_mode == SPUDownloadModePersistent) {
++        NSString *size = [request valueForHTTPHeaderField:@"X-Vibe-Meter-Archive-Size"];
++        _expectedSHA256 = [[request valueForHTTPHeaderField:@"X-Vibe-Meter-Archive-SHA256"] copy];
++        long long bytes = size.longLongValue;
++        if (bytes <= 0 || bytes > 128 * 1024 * 1024 || _expectedSHA256 == nil ||
++            [_expectedSHA256 rangeOfString:@"^[0-9a-f]{64}$" options:NSRegularExpressionSearch].location == NSNotFound) {
++            [self failDownloadWithMessage:@"The update archive lacks GitHub's expected size or SHA-256."];
++            return;
+         }
++        _byteLimit = (NSUInteger)bytes;
++        [anonymousRequest setValue:nil forHTTPHeaderField:@"X-Vibe-Meter-Archive-Size"];
++        [anonymousRequest setValue:nil forHTTPHeaderField:@"X-Vibe-Meter-Archive-SHA256"];
++    } else {
++        _byteLimit = 1024 * 1024;
+     }
+-    
++
++    anonymousRequest.HTTPShouldHandleCookies = NO;
++    [anonymousRequest setValue:nil forHTTPHeaderField:@"Cookie"];
++    [anonymousRequest setValue:nil forHTTPHeaderField:@"Authorization"];
++    NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
++    configuration.HTTPShouldSetCookies = NO;
++    configuration.HTTPCookieStorage = nil;
++    configuration.URLCredentialStorage = nil;
++    configuration.timeoutIntervalForRequest = 30.0;
++    configuration.timeoutIntervalForResource = 180.0;
++    _downloadSession = [NSURLSession sessionWithConfiguration:configuration delegate:self delegateQueue:NSOperationQueue.mainQueue];
++    _sessionTask = [_downloadSession downloadTaskWithRequest:anonymousRequest];
+     [_sessionTask resume];
+ }
+ 
+-// Don't implement dealloc - make the client call cleanup, which is the only way to remove the reference cycle from the delegate anyway
++- (void)URLSession:(NSURLSession *)__unused session task:(NSURLSessionTask *)task willPerformHTTPRedirection:(NSHTTPURLResponse *)__unused response newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest * _Nullable))completionHandler
++{
++    completionHandler(SUAllowedURL(request.URL, task.originalRequest.URL) ? request : nil);
++}
++
++- (void)URLSession:(NSURLSession *)__unused session task:(NSURLSessionTask *)__unused task didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable))completionHandler
++{
++    BOOL isServerTrust = [challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust];
++    completionHandler(isServerTrust ? NSURLSessionAuthChallengePerformDefaultHandling : NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
++}
+ 
+ - (void)startPersistentDownloadWithRequest:(NSURLRequest *)request bundleIdentifier:(NSString *)bundleIdentifier desiredFilename:(NSString *)desiredFilename
+ {
+@@ -192,7 +234,7 @@
+ {
+     NSInteger statusCode = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 200;
+     
+-    if ((statusCode < 200) || (statusCode >= 400))
++    if ((statusCode < 200) || (statusCode >= 300))
+     {
+         NSString *message = [NSString stringWithFormat:@"A network error occurred while downloading %@. %@ (%ld)", url.absoluteString, [NSHTTPURLResponse localizedStringForStatusCode:statusCode], (long)statusCode];
+         NSError *error = [NSError errorWithDomain:SUSparkleErrorDomain code:SUDownloadError userInfo:@{ NSLocalizedDescriptionKey: message }];
+@@ -247,6 +289,32 @@
+         return;
+     }
+     
++    NSNumber *size = nil;
++    if (![location getResourceValue:&size forKey:NSURLFileSizeKey error:nil] || size.unsignedLongLongValue > _byteLimit) {
++        [self failDownloadWithMessage:@"The update download exceeds the allowed size."];
++        return;
++    }
++    if (_mode == SPUDownloadModeTemporary) {
++        NSData *feed = [NSData dataWithContentsOfURL:location options:(NSDataReadingOptions)0 error:nil];
++        [self temporaryDownloadDidFinishWithData:feed response:downloadTask.response error:nil];
++        return;
++    }
++    NSData *archive = [NSData dataWithContentsOfURL:location options:NSDataReadingMappedIfSafe error:nil];
++    if (archive == nil || archive.length != _byteLimit) {
++        [self failDownloadWithMessage:@"The update archive size differs from GitHub's record."];
++        return;
++    }
++    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
++    CC_SHA256(archive.bytes, (CC_LONG)archive.length, digest);
++    NSMutableString *hash = [NSMutableString stringWithCapacity:64];
++    for (NSUInteger index = 0; index < CC_SHA256_DIGEST_LENGTH; ++index) {
++        [hash appendFormat:@"%02x", digest[index]];
++    }
++    if (![hash isEqualToString:_expectedSHA256]) {
++        [self failDownloadWithMessage:@"The update archive SHA-256 differs from GitHub's record."];
++        return;
++    }
++
+     // Remove our old caches path so we don't start accumulating files in there
+     NSString *rootPersistentDownloadCachePath = [self rootPersistentDownloadCachePathForBundleIdentifier:_bundleIdentifier];
+ 
+@@ -272,8 +340,8 @@
+             
+             [_delegate downloaderDidFailWithError:error];
+         } else {
+-            NSString *name = _sessionTask.response.suggestedFilename;
+-            if (!name) {
++            NSString *name = _sessionTask.originalRequest.URL.lastPathComponent;
++            if (name.length == 0) {
+                 name = location.lastPathComponent; // This likely contains nothing useful to identify the file (e.g. CFNetworkDownload_87LVIz.tmp)
+             }
+             NSString *toPath = [downloadFileNameDirectory stringByAppendingPathComponent:name];
+@@ -306,8 +374,12 @@
+     }
+ }
+ 
+-- (void)URLSession:(NSURLSession *)__unused session downloadTask:(NSURLSessionDownloadTask *)__unused downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)__unused totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
++- (void)URLSession:(NSURLSession *)__unused session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
+ {
++    if (totalBytesWritten > (int64_t)_byteLimit || totalBytesExpectedToWrite > (int64_t)_byteLimit) {
++        [downloadTask cancel];
++        return;
++    }
+     if (_mode != SPUDownloadModePersistent) {
+         return;
+     }
+--- a/Autoupdate/AppInstaller.m
++++ b/Autoupdate/AppInstaller.m
+@@ -54,6 +54,8 @@
+     // Must be synchronized with _newConnectionLock
+     // Set from new connection handler, and also set/read from main thread
+     NSXPCConnection *_activeConnection;
++    // A disconnected updater cannot be replaced by a new client.
++    BOOL _acceptedUpdaterConnection;
+     
+     id<SUInstallerCommunicationProtocol> _communicator;
+     AgentConnection *_agentConnection;
+@@ -99,6 +101,8 @@
+     BOOL _performedStage1Installation;
+     BOOL _receivedAppcastItemData;
+     
++    // Main queue: stage 1 extraction alone does not authorize replacing the App.
++    BOOL _receivedExplicitCommit;
+     BOOL _performedStage2Installation;
+     BOOL _performedStage3Installation;
+     
+@@ -130,7 +134,7 @@
+ {
+     os_unfair_lock_lock(&_newConnectionLock);
+     {
+-        if (_activeConnection != nil) {
++        if (_acceptedUpdaterConnection) {
+             os_unfair_lock_unlock(&_newConnectionLock);
+             
+             SULog(SULogLevelError, @"Error: Rejecting multiple XPC connections for installer...");
+@@ -143,9 +147,8 @@
+         BOOL connectionCodeSigningValidationSkipped = NO;
+     #endif
+         
+-        // It's safe to allow any connections once stage 1 installation is complete and appcast data has been received.
+-        // This is to allow general updaters to resume the installation.
+-        if (!_performedStage1Installation || !_receivedAppcastItemData) {
++        // Vibe Meter only accepts the original validated updater for a single installation.
++        {
+             BOOL passesValidation;
+             NSError *validationError = nil;
+             SUValidateConnectionStatus status = [SUCodeSigningVerifier validateConnection:newConnection error:&validationError];
+@@ -179,6 +182,7 @@
+         _connectionCodeSigningValidationSkipped = connectionCodeSigningValidationSkipped;
+ #endif
+         _activeConnection = newConnection;
++        _acceptedUpdaterConnection = YES;
+     }
+     os_unfair_lock_unlock(&_newConnectionLock);
+     
+@@ -205,8 +209,8 @@
+         dispatch_async(dispatch_get_main_queue(), ^{
+             __typeof__(self) strongSelf = weakSelf;
+             if (strongSelf != nil) {
+-                if (strongSelf->_activeConnection != nil && !strongSelf->_willCompleteInstallation) {
+-                    [strongSelf cleanupAndExitWithStatus:EXIT_FAILURE error:[NSError errorWithDomain:SUSparkleErrorDomain code:SPUInstallerError userInfo:@{ NSLocalizedDescriptionKey: @"Invalidation on remote port being called, and installation is not close enough to completion!" }]];
++                if (!strongSelf->_receivedExplicitCommit) {
++                    [strongSelf cleanupAndExitWithStatus:EXIT_FAILURE error:[NSError errorWithDomain:SUSparkleErrorDomain code:SPUInstallerError userInfo:@{ NSLocalizedDescriptionKey: @"The updater disconnected before explicitly committing the installation." }]];
+                 }
+                 strongSelf->_communicator = nil;
+                 
+@@ -652,11 +656,15 @@
+         }
+         os_unfair_lock_unlock(&_newConnectionLock);
+     } else if (identifier == SPUResumeInstallationToStage2 && data.length == sizeof(uint8_t) * 2) {
+-        // Because anyone can ask us to resume the installation, it may be wise to think about backwards compatibility here if IPC changes
++        // Only the original validated updater can send this commit after stage 1.
+         uint8_t relaunch = *((const uint8_t *)data.bytes);
+         uint8_t showsUI = *((const uint8_t *)data.bytes + 1);
+         
+         dispatch_async(dispatch_get_main_queue(), ^{
++            if (!self->_performedStage1Installation || self->_targetTerminated) {
++                return;
++            }
++            self->_receivedExplicitCommit = YES;
+             // This flag has an impact on showing UI progress during installations
+             self->_shouldShowUI = (BOOL)showsUI;
+             // Don't test if the application was alive initially, leave that to the progress agent if we decide to relaunch
+@@ -765,6 +773,10 @@
+ - (void)finishInstallationAfterHostTermination SPU_OBJC_DIRECT
+ {
+     assert(self->_targetTerminated);
++    if (!_receivedExplicitCommit) {
++        [self cleanupAndExitWithStatus:EXIT_FAILURE error:[NSError errorWithDomain:SUSparkleErrorDomain code:SPUInstallerError userInfo:@{NSLocalizedDescriptionKey: @"Vibe Meter exited before explicitly committing this update."}]];
++        return;
++    }
+     
+     // Show our installer progress UI tool if only after a certain amount of time passes
+     __block BOOL shouldShowUIProgress = YES;

@@ -57,7 +57,7 @@ import Testing
             return try #require(obj["method"] as? String)
         }
         #expect(methods == ["initialize", "initialized", "account/rateLimits/read"])
-        #expect(CodexAppServerClient.allowedMethods == ["initialize", "initialized", "account/rateLimits/read", "thread/turns/list"])
+        #expect(CodexAppServerClient.allowedMethods == ["initialize", "initialized", "account/rateLimits/read", "thread/turns/list", "thread/read"])
         #expect(!CodexAppServerClient.allowedMethods.contains("account/rateLimitResetCredit/consume"))
         #expect(lines.allSatisfy { !$0.contains("\n") })
         let turnLines = CodexAppServerClient.requestLines(method: "thread/turns/list", params: ["threadId": TestSupport.sessionA, "limit": 1])
@@ -110,13 +110,7 @@ import Testing
             let t = try await CodexAppServerClient(binary: binary).latestTurn(threadID: s.id)
             print("[live] thread \(s.id.prefix(8)) latest=\(t?.status ?? "nil") error=\(t?.errorInfo ?? "-") limitFailure=\(t?.isUsageLimitFailure ?? false)")
         }
-        if let claude = ClaudeLocator.find() {
-            let a = await ClaudeAccountIdentity.current(claudeBinary: claude)
-            print("[live] claude account method=\(a?.authMethod ?? "nil") subscription=\(a?.subscriptionType ?? "-") keyLen=\(a?.accountKey.count ?? 0)")
-        }
-        for t in ClaudeTranscriptStore().recentSessions(limit: 3) {
-            print("[live] claude \(t.id.prefix(8)) model=\(t.lastModel ?? "nil") limit=\(t.limitHit?.limitType ?? "-")")
-        }
+
     }
 }
 

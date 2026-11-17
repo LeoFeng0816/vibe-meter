@@ -87,21 +87,25 @@ public struct CodexLocalStore: Sendable {
     }
 
     /// 最近活動的工作階段。
-    public func recentSessions(limit: Int = 8, within: TimeInterval = 7 * 86400, now: Date = Date()) -> [CodexSessionInfo] {
+    public func recentSessions(limit: Int = 8, within: TimeInterval = 8 * 86400, now: Date = Date(), priority: Set<String> = []) -> [CodexSessionInfo] {
         let names = threadNames()
         var sessions: [CodexSessionInfo] = []
+        var prioritized: [CodexSessionInfo] = []
+        var seen = Set<String>()
         for file in rolloutFiles(modifiedAfter: now.addingTimeInterval(-within)) {
-            guard sessions.count < limit else { break }
+            if sessions.count >= limit && prioritized.count >= priority.count { break }
             // 子代理 thread 屬於父工作階段的內部細節，不列出、不作為自動繼續對象。
             guard let meta = Self.sessionMeta(in: file.url), meta.isSubagent == false else { continue }
-            if sessions.contains(where: { $0.id == meta.id }) { continue }
+            let isPriority = priority.contains(meta.id.lowercased())
+            guard (isPriority || sessions.count < limit), seen.insert(meta.id.lowercased()).inserted else { continue }
             let limitType = Self.lastRateLimit(in: file.url)?.limitReachedType
-            sessions.append(CodexSessionInfo(id: meta.id, threadName: names[meta.id], cwd: meta.cwd,
-                                             startedAt: meta.timestamp.flatMap(ISO8601.parse),
-                                             lastActivity: file.modified, rolloutPath: file.url.path,
-                                             lastLimitReachedType: limitType))
+            let session = CodexSessionInfo(id: meta.id, threadName: names[meta.id], cwd: meta.cwd,
+                                           startedAt: meta.timestamp.flatMap(ISO8601.parse),
+                                           lastActivity: file.modified, rolloutPath: file.url.path,
+                                           lastLimitReachedType: limitType)
+            if isPriority { prioritized.append(session) } else { sessions.append(session) }
         }
-        return sessions
+        return prioritized + sessions
     }
 
     struct SessionMetaLine: Decodable {

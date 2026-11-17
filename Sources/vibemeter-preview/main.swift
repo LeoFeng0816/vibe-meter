@@ -71,6 +71,13 @@ func compose(_ panels: [NSBitmapImageRep]) -> Data {
 }
 
 MainActor.assumeIsolated {
+    if args.count > 1, args[1] == "--dump-l10n" {
+        // 檢查用：列出所有翻譯 key 的簡體與英文結果。
+        for key in L10nTable.entries.keys.sorted() {
+            print("\(key)\t\(L10n.template(key, in: .zhHans))\t\(L10n.template(key, in: .en))".replacingOccurrences(of: "\n", with: "⏎"))
+        }
+        exit(0)
+    }
     if args.count > 1, args[1] == "--menubar-icon", args.count > 2 {
         // 檢查用：把選單列樣板圖示放大輸出（淺色、深色選單列各一）。
         let img = MenuBarIcon.image(size: 18)
@@ -96,7 +103,7 @@ MainActor.assumeIsolated {
         try data.write(to: url)
         print(url.path)
     } catch {
-        FileHandle.standardError.write(Data("寫入失敗：\(error)\n".utf8))
+        FileHandle.standardError.write(Data("write failed: \(error)\n".utf8))
         exit(1)
     }
 }

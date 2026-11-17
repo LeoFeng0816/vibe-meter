@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 import VibeMeterCore
 
@@ -9,6 +10,11 @@ import VibeMeterCore
 let args = CommandLine.arguments.dropFirst()
 let input = FileHandle.standardInput.readDataToEndOfFile()
 let store = ClaudeBridgeStore()
+// 狀態列文字使用 Vibe Meter 設定的語言（只讀取語言設定）。
+if let raw = CFPreferencesCopyAppValue(AppLanguage.defaultsKey as CFString, "com.leofeng.vibemeter" as CFString) as? String,
+   let language = AppLanguage(rawValue: raw) {
+    L10n.current = language
+}
 
 func runChained(_ command: String, stdin: Data) -> String? {
     let process = Process()
@@ -37,10 +43,12 @@ case "claude-statusline":
     } else if let parsed {
         print(StatusLineText.compact(parsed.usageWindows()))
     }
+case "antigravity-statusline":
+    _ = try? AntigravityBridgeStore().recordStatusLine(input)
 case "claude-stop-failure":
     let reason = args.dropFirst().first ?? "unknown"
     try? store.recordStopFailure(input, reason: reason)
 default:
-    FileHandle.standardError.write(Data("usage: vibemeter-bridge claude-statusline | claude-stop-failure <reason>\n".utf8))
+    FileHandle.standardError.write(Data("usage: vibemeter-bridge claude-statusline | claude-stop-failure <reason> | antigravity-statusline\n".utf8))
 }
 exit(0)

@@ -4,18 +4,24 @@ import Foundation
 public enum CodexRateLimitParser {
     // MARK: app-server `account/rateLimits/read` 回應（camelCase）
 
-    struct AppServerWindow: Decodable {
+    struct AppServerWindow: Decodable, Equatable {
         var usedPercent: Double
         var windowDurationMins: Int?
         var resetsAt: Int64?
     }
 
-    struct AppServerSnapshot: Decodable {
+    struct AppServerSnapshot: Decodable, Equatable {
         var limitId: String?
+        var normalModelSlug: String?
         var primary: AppServerWindow?
         var secondary: AppServerWindow?
         var planType: String?
         var rateLimitReachedType: String?
+        var spendControlReached: Bool?
+
+        func modelSlugCompatible(with other: Self) -> Bool {
+            normalModelSlug == nil || other.normalModelSlug == nil || normalModelSlug == other.normalModelSlug
+        }
     }
 
     struct AppServerResult: Decodable {
@@ -23,20 +29,47 @@ public enum CodexRateLimitParser {
         /// 官方註解：後端對一般內含用量的許可；null 表示不可用，不可由百分比或重設時間推斷恢復。
         var ordinaryUsageAllowed: Bool?
         var accountId: String?
+        var rateLimitsByLimitId: [String: AppServerSnapshot]?
+    }
+
+    static func windows(_ s: AppServerSnapshot) -> [UsageWindow] {
+        [s.primary, s.secondary].compactMap { w -> UsageWindow? in
+            // 超額時官方值可能大於 100；保留為「已滿」而不是丟掉整個週期。
+            guard let w, w.usedPercent.isFinite, w.usedPercent >= 0, let kind = WindowKind.fromMinutes(w.windowDurationMins) else { return nil }
+            return UsageWindow(kind: kind, usedPercent: min(w.usedPercent, 100), resetsAt: w.resetsAt.map(Self.date))
+        }
     }
 
     /// `result` 物件（JSON-RPC 回應的 result 欄位）→ 快照。
     public static func parseAppServerResult(_ data: Data, observedAt: Date) throws -> UsageSnapshot {
         let result = try JSONDecoder().decode(AppServerResult.self, from: data)
         let rl = result.rateLimits
-        let windows = [rl.primary, rl.secondary].compactMap { w -> UsageWindow? in
-            guard let w, let kind = WindowKind.fromMinutes(w.windowDurationMins) else { return nil }
-            return UsageWindow(kind: kind, usedPercent: w.usedPercent, resetsAt: w.resetsAt.map(Self.date))
+        let windows = Self.windows(rl)
+        var sourceBuckets = result.rateLimitsByLimitId ?? [:]
+        let inconsistent = sourceBuckets.contains { key, value in
+            key.isEmpty || (value.limitId != nil && value.limitId != key)
+        }
+        var matchingPrimary = true
+        if let id = rl.limitId, !id.isEmpty {
+            if let existing = sourceBuckets[id] {
+                matchingPrimary = existing.modelSlugCompatible(with: rl) &&
+                    Self.windows(existing) == windows && existing.rateLimitReachedType == rl.rateLimitReachedType
+            } else {
+                sourceBuckets[id] = rl
+            }
+        }
+        let buckets: [LimitBucket] = if inconsistent || !matchingPrimary { [] } else {
+            sourceBuckets.sorted { $0.key < $1.key }.map { id, value in
+                LimitBucket(limitID: id, modelSlug: value.normalModelSlug ?? (rl.limitId == id ? rl.normalModelSlug : nil),
+                            windows: Self.windows(value), limitReachedType: value.rateLimitReachedType,
+                            spendControlReached: value.spendControlReached)
+            }
         }
         return UsageSnapshot(provider: .codex, windows: windows, observedAt: observedAt,
                              source: .codexAppServer, planName: rl.planType,
                              limitReachedType: rl.rateLimitReachedType, accountID: result.accountId,
-                             usageAllowed: result.ordinaryUsageAllowed)
+                             usageAllowed: result.ordinaryUsageAllowed, buckets: buckets.isEmpty ? nil : buckets,
+                             spendControlReached: rl.spendControlReached)
     }
 
     // MARK: rollout JSONL `event_msg` / `token_count`（snake_case）
