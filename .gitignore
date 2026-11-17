@@ -1,0 +1,8 @@
+.build/
+build/
+.swiftpm/
+*.xcuserstate
+DerivedData/
+.DS_Store
+Resources/BrandIcons/
+dist/
